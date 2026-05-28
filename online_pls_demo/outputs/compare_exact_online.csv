@@ -1,0 +1,6 @@
+metric,exact,online
+compliance,14319.147346146457,14543.074998745895
+volume,0.4999993887459256,0.5000117705128726
+exact_calls,16,13
+predicted_steps,0,4
+relative_compliance_degradation,0.0,0.015638337059203485

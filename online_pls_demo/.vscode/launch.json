@@ -1,0 +1,14 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run online PLS demo",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_demo.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
+
