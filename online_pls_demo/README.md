@@ -49,9 +49,22 @@ python run_demo.py --mode online --max-iter 40
 # Exact-vs-online comparison
 python run_demo.py --mode compare --max-iter 40
 
+# SVG-only process visualization
+python run_demo.py --max-iter 20 --save-process --svg-only --snapshot-every 2
+
+# Live window visualization during optimization
+python run_demo.py --max-iter 20 --live --live-hold
+
 # Legacy load location comparison
 python run_demo.py --load middle
 ```
+
+When `--live` is enabled, the script selects a GUI Matplotlib backend such as
+`TkAgg`. If it prints `Matplotlib backend: Agg`, the current Python environment
+cannot open an interactive window.
+Live mode also enables volume continuation by default: the design starts from
+`volume_start = 0.95` and gradually decreases to `volfrac = 0.5`. You can tune
+this explicitly with `--volume-start` and `--volume-relax`.
 
 Gradient verification:
 
@@ -65,16 +78,26 @@ Single-run mode writes:
 
 - `outputs/history.csv`
 - `outputs/final_topology.png`
+- `outputs/final_topology.svg`
 - `outputs/final_contour.png`
+- `outputs/final_contour.svg`
 - `outputs/convergence.png`
+- `outputs/convergence.svg`
+- `outputs/process_exact.svg` or `outputs/process_online.svg` when `--save-process` is enabled
+- `outputs/process_*_frames/*.svg` when `--save-process` is enabled
 
 Comparison mode writes:
 
 - `outputs/history_exact.csv`
 - `outputs/history_online.csv`
 - `outputs/final_exact_topology.png`
+- `outputs/final_exact_topology.svg`
 - `outputs/final_exact_contour.png`
+- `outputs/final_exact_contour.svg`
 - `outputs/final_online_topology.png`
+- `outputs/final_online_topology.svg`
 - `outputs/final_online_contour.png`
+- `outputs/final_online_contour.svg`
 - `outputs/convergence_compare.png`
+- `outputs/convergence_compare.svg`
 - `outputs/compare_exact_online.csv`

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import torch
 
@@ -28,6 +29,15 @@ class HistoryRow:
     correction_error: float
 
 
+@dataclass
+class DesignSnapshot:
+    iteration: int
+    mode: str
+    alpha: torch.Tensor
+    compliance: float
+    volume: float
+
+
 class ExactPLSOptimizer:
     """Deterministic RBF/PLSM baseline using exact FEM sensitivities."""
 
@@ -42,6 +52,9 @@ class ExactPLSOptimizer:
         initial_project: bool = True,
         project_each_step: bool = True,
         projection_refine_steps: int = 12,
+        volume_start: float | None = None,
+        volume_relax: int = 0,
+        snapshot_callback: Callable[[DesignSnapshot, list[HistoryRow]], None] | None = None,
         device: str = "cpu",
     ) -> None:
         self.level_set = level_set
@@ -53,15 +66,34 @@ class ExactPLSOptimizer:
         self.initial_project = initial_project
         self.project_each_step = project_each_step
         self.projection_refine_steps = projection_refine_steps
+        self.final_volume_target = float(self.solver.volume_target)
+        self.volume_start = volume_start
+        self.volume_relax = volume_relax
+        self.current_projection_target = self._projection_target_for_iteration(0)
+        self.snapshot_callback = snapshot_callback
         self.device = torch.device(device)
         self.rows: list[HistoryRow] = []
+        self.snapshots: list[DesignSnapshot] = []
 
     def exact_oracle(self, alpha: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
         return self.solver.evaluate_alpha(self.level_set, alpha)
 
+    def _projection_target_for_iteration(self, iteration: int) -> float:
+        if self.volume_start is None or self.volume_relax <= 0:
+            return self.final_volume_target
+        ratio = min(max(iteration / self.volume_relax, 0.0), 1.0)
+        return (1.0 - ratio) * self.volume_start + ratio * self.final_volume_target
+
+    def set_projection_target(self, iteration: int) -> None:
+        self.current_projection_target = self._projection_target_for_iteration(iteration)
+
+    def has_volume_continuation(self) -> bool:
+        return self.volume_start is not None and self.volume_relax > 0
+
     def project_volume(self, alpha: torch.Tensor) -> torch.Tensor:
-        """Only used for initialization so the run starts from the target volume."""
+        """Shift the level-set bias to the current continuation volume target."""
         out = alpha.detach().clone()
+        target = self.current_projection_target
         lo = out[-1] - 8.0
         hi = out[-1] + 8.0
         for _ in range(35):
@@ -72,7 +104,7 @@ class ExactPLSOptimizer:
                 vol = self.solver.projection_volume_fraction(self.level_set, trial)
             else:
                 vol = self.solver.volume_fraction(self.level_set, trial)
-            if vol > self.solver.volume_target:
+            if vol > target:
                 hi = mid
             else:
                 lo = mid
@@ -85,7 +117,7 @@ class ExactPLSOptimizer:
                 trial = out.clone()
                 trial[-1] = mid
                 vol = self.solver.volume_fraction(self.level_set, trial)
-                if vol > self.solver.volume_target:
+                if vol > target:
                     hi = mid
                 else:
                     lo = mid
@@ -163,10 +195,29 @@ class ExactPLSOptimizer:
             correction_error=correction_error,
         )
 
+    def record_snapshot(
+        self,
+        iteration: int,
+        mode: str,
+        alpha: torch.Tensor,
+        metrics: dict[str, float],
+    ) -> None:
+        snapshot = DesignSnapshot(
+            iteration,
+            mode,
+            alpha.clone(),
+            metrics["compliance"],
+            metrics["volume"],
+        )
+        self.snapshots.append(snapshot)
+        if self.snapshot_callback is not None:
+            self.snapshot_callback(snapshot, self.rows)
+
     def run(
         self, seed: int = 7, initial_alpha: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, list[HistoryRow]]:
         alpha = initial_alpha.detach().cpu() if initial_alpha is not None else self.level_set.initial_parameters(seed=seed).detach().cpu()
+        self.set_projection_target(0)
         if self.initial_project:
             alpha = self.project_volume(alpha)
 
@@ -174,8 +225,16 @@ class ExactPLSOptimizer:
         grad = grad.detach().cpu()
         exact_calls = 1
         self.rows = [self.make_row(0, "exact", metrics, grad, exact_calls)]
+        self.snapshots = []
+        self.record_snapshot(0, "exact", alpha, metrics)
 
         for it in range(1, self.max_iter + 1):
+            self.set_projection_target(it)
+            if self.has_volume_continuation():
+                alpha = self.project_volume(alpha)
+                grad, metrics = self.exact_oracle(alpha)
+                grad = grad.detach().cpu()
+                exact_calls += 1
             alpha, grad, metrics, accepted_step, calls = self.exact_step(alpha, grad, metrics)
             exact_calls += calls
             self.rows.append(
@@ -189,6 +248,7 @@ class ExactPLSOptimizer:
                     gradient_source="exact",
                 )
             )
+            self.record_snapshot(it, "exact", alpha, metrics)
         return alpha, self.rows
 
     def write_history(self, path: Path) -> None:
@@ -268,6 +328,7 @@ class OnlinePLSOptimizer(ExactPLSOptimizer):
         self, seed: int = 7, initial_alpha: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, list[HistoryRow]]:
         alpha = initial_alpha.detach().cpu() if initial_alpha is not None else self.level_set.initial_parameters(seed=seed).detach().cpu()
+        self.set_projection_target(0)
         if self.initial_project:
             alpha = self.project_volume(alpha)
 
@@ -282,9 +343,12 @@ class OnlinePLSOptimizer(ExactPLSOptimizer):
         last_exact_metrics = metrics
         has_unverified_prediction = False
         self.rows = [self.make_row(0, "exact", metrics, grad, exact_calls, gradient_source="exact")]
+        self.snapshots = []
+        self.record_snapshot(0, "exact", alpha, metrics)
         self.remember_exact(alpha, prev_alpha, prev_grad, grad, metrics)
 
         for it in range(1, self.max_iter + 1):
+            self.set_projection_target(it)
             must_check = it <= self.warmup or it % self.exact_every == 0 or len(self.features) <= self.seq_len
             correction_error = float("nan")
 
@@ -312,6 +376,7 @@ class OnlinePLSOptimizer(ExactPLSOptimizer):
                                 correction_error=correction_error,
                             )
                         )
+                        self.record_snapshot(it, "rollback", alpha, metrics)
                         continue
                     grad = check_grad.detach().cpu()
                     metrics = check_metrics
@@ -342,6 +407,7 @@ class OnlinePLSOptimizer(ExactPLSOptimizer):
                         correction_error=correction_error,
                     )
                 )
+                self.record_snapshot(it, "exact", alpha, metrics)
                 continue
 
             seq = torch.stack(self.features[-self.seq_len :], dim=0)
@@ -376,4 +442,5 @@ class OnlinePLSOptimizer(ExactPLSOptimizer):
                     angle_cosine=pred.angle_cosine,
                 )
             )
+            self.record_snapshot(it, source, alpha, metrics)
         return alpha, self.rows
